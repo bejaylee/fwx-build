@@ -1,0 +1,210 @@
+name: Build fwx.ko for iStoreOS 24.10
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/build-fwx.yml'
+      - 'package/fcm/fwx/**'
+
+env:
+  SDK_URL: https://mirrors.cernet.edu.cn/openwrt/releases/24.10.8/targets/x86/64/openwrt-sdk-24.10.8-x86-64_gcc-13.3.0_musl.Linux-x86_64.tar.zst
+  FORCE_UNSAFE_CONFIGURE: 1
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout fwx package
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq \
+            build-essential ccache curl file flex gawk gettext git \
+            libelf-dev libncurses5-dev libssl-dev patch python3 \
+            python3-pyelftools rsync unzip wget xsltproc zstd 2>&1 | tail -3
+          echo "=== Dependencies installed ==="
+
+      - name: Download OpenWrt SDK 24.10.8 (pre-compiled toolchain)
+        run: |
+          echo "Downloading SDK..."
+          wget -q --show-progress "$SDK_URL" -O sdk.tar.zst
+          ls -lh sdk.tar.zst
+          echo "=== Extracting SDK ==="
+          tar --zstd -xf sdk.tar.zst
+          mv openwrt-sdk-* sdk
+          rm sdk.tar.zst
+          echo "=== SDK ready ==="
+          ls sdk/
+          echo "=== Kernel version in SDK ==="
+          grep "LINUX_VERSION-6.6" sdk/include/kernel-6.6 2>/dev/null || echo "checking kernel.mk..."
+          grep -r "6.6.144" sdk/include/kernel-6.6 sdk/target/linux/x86/Makefile 2>/dev/null | head -5
+
+      - name: Inject fwx package into SDK
+        run: |
+          mkdir -p sdk/package/fcm
+          cp -r package/fcm/fwx sdk/package/fcm/fwx
+          echo "=== fwx source files ==="
+          ls -la sdk/package/fcm/fwx/src/
+          echo "=== Makefile ==="
+          cat sdk/package/fcm/fwx/Makefile
+
+      - name: Update package feeds (minimal)
+        working-directory: sdk
+        run: |
+          ./scripts/feeds update base 2>&1 | tail -5
+          ./scripts/feeds install -p base libmnl 2>/dev/null || true
+          echo "=== Feeds ready ==="
+
+      - name: Configure build
+        working-directory: sdk
+        run: |
+          cat > .config <<'EOF'
+          CONFIG_DEVEL=y
+          CONFIG_CCACHE=y
+          CONFIG_PACKAGE_kmod-fwx=m
+          EOF
+          make defconfig 2>&1 | tail -10
+          echo "=== Verify fwx in config ==="
+          grep -i fwx .config || echo "WARNING: fwx not found!"
+
+      - name: Check kernel vermagic in SDK
+        working-directory: sdk
+        run: |
+          # Find the kernel build directory in the SDK
+          KDIR=$(find build_dir -maxdepth 4 -type d -name "linux-6.6.144*" 2>/dev/null | head -1)
+          echo "Kernel dir: $KDIR"
+          if [ -n "$KDIR" ]; then
+            echo "=== .vermagic ==="
+            cat "$KDIR/.vermagic" 2>/dev/null || echo "no .vermagic yet (will be generated)"
+          fi
+          # Check the vermagic from staging
+          find staging_dir -name ".vermagic" 2>/dev/null -exec cat {} \;
+          echo "=== Target kernel version ==="
+          grep -r "LINUX_VERSION" target/linux/x86/Makefile include/kernel-6.6 2>/dev/null | head -5
+
+      - name: Prepare kernel headers
+        working-directory: sdk
+        run: |
+          echo "=== Preparing kernel build tree ==="
+          make target/linux/prepare V=s 2>&1 | tail -20
+          KDIR=$(find build_dir -maxdepth 4 -type d -name "linux-6.6.144*" 2>/dev/null | head -1)
+          echo "Kernel dir: $KDIR"
+          if [ -n "$KDIR" ]; then
+            echo "=== vermagic ==="
+            cat "$KDIR/.vermagic" 2>/dev/null || echo "no .vermagic file"
+          fi
+
+      - name: Build fwx kernel module
+        working-directory: sdk
+        run: |
+          echo "=== Compiling fwx.ko ==="
+          make package/fcm/fwx/compile V=s 2>&1 | tee /tmp/build_fwx.log | tail -100
+
+      - name: Find build outputs
+        working-directory: sdk
+        run: |
+          echo "=== fwx.ko ==="
+          find build_dir -name "fwx.ko" -type f 2>/dev/null
+          echo ""
+          echo "=== kmod-fwx ipk ==="
+          find bin -name "*fwx*" -type f 2>/dev/null
+          echo ""
+          echo "=== All kmod ipks in bin ==="
+          find bin -name "kmod-*" -type f 2>/dev/null | head -20
+
+      - name: Collect and verify artifact
+        working-directory: sdk
+        run: |
+          mkdir -p ../artifact
+
+          # Collect fwx.ko
+          KO=$(find build_dir -name "fwx.ko" -type f 2>/dev/null | head -1)
+          if [ -z "$KO" ]; then
+            echo "ERROR: fwx.ko not found!"
+            find . -name "fwx.ko" 2>/dev/null
+            cat /tmp/build_fwx.log | tail -50
+            exit 1
+          fi
+          cp "$KO" ../artifact/fwx.ko
+
+          # Collect ipk if available
+          IPK=$(find bin -name "*kmod-fwx*" -type f 2>/dev/null | head -1)
+          if [ -n "$IPK" ]; then
+            cp "$IPK" ../artifact/
+            echo "Found ipk: $(basename $IPK)"
+          fi
+
+          # Verify
+          echo ""
+          echo "=== fwx.ko file info ==="
+          ls -la ../artifact/fwx.ko
+          file ../artifact/fwx.ko
+
+          echo ""
+          echo "=== modinfo vermagic ==="
+          # SDK's modinfo
+          HOST_MODINFO=$(find build_dir/host -name modinfo -type f 2>/dev/null | head -1)
+          if [ -n "$HOST_MODINFO" ]; then
+            "$HOST_MODINFO" ../artifact/fwx.ko 2>/dev/null
+          else
+            modinfo ../artifact/fwx.ko 2>/dev/null || strings ../artifact/fwx.ko | grep -i vermagic | head -3
+          fi
+
+          echo ""
+          echo "=== Expected vermagic ==="
+          echo "6.6.144 SMP mod_unload"
+
+          # Install instructions
+          cat > ../artifact/INSTALL.txt <<'INNER'
+fwx.ko for iStoreOS 24.10.8 (kernel 6.6.144, x86_64)
+=====================================================
+
+Router: iStoreOS 24.10.8
+Kernel: 6.6.144 SMP mod_unload
+Arch: x86_64
+Compiler: GCC 13.3.0 + musl
+
+Quick test (memory only, removed on reboot):
+  scp fwx.ko root@192.168.9.1:/tmp/
+  ssh root@192.168.9.1
+  insmod /tmp/fwx.ko
+  lsmod | grep fwx
+  dmesg | tail -20 | grep fwx
+  ls -la /proc/net/af_active_app /proc/net/af_active_host
+
+If ipk is available (persistent):
+  scp kmod-fwx_*.ipk root@192.168.9.1:/tmp/
+  ssh root@192.168.9.1
+  opkg install /tmp/kmod-fwx_*.ipk
+
+Uninstall:
+  rmmod fwx
+  # or if installed via ipk:
+  opkg remove kmod-fwx
+INNER
+
+          cp /tmp/build_fwx.log ../artifact/build_fwx.log 2>/dev/null || true
+
+          echo ""
+          echo "=== Artifact contents ==="
+          ls -la ../artifact/
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: fwx-ko-istoreos-24.10.8-kernel6.6.144
+          path: artifact/
+          retention-days: 30
+
+      - name: Upload build log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-fail-log
+          path: /tmp/build_fwx.log
+          retention-days: 14
