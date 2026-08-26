@@ -18,6 +18,7 @@
 
 struct fwx_ct_entry {
 	struct hlist_node node;
+	struct rcu_head rcu;
 	struct nf_conn *ct;
 	struct fwx_ct_data data;
 	unsigned long last_used;
@@ -115,7 +116,7 @@ void fwx_ct_data_gc(void)
 		hlist_for_each_entry_safe(entry, n, &fwx_ct_hash[i], node) {
 			if (time_after(now, entry->last_used + FWX_CT_TIMEOUT)) {
 				hlist_del_rcu(&entry->node);
-				kfree_rcu(entry, node);
+				kfree_rcu(entry, rcu);
 			}
 		}
 	}

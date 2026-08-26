@@ -65,7 +65,8 @@ jobs:
       - name: Build fwx module
         working-directory: sdk
         run: |
-          make package/fcm/fwx/compile V=s 2>&1 | tee build.log | tail -100
+          set -o pipefail
+          make package/fcm/fwx/compile V=s 2>&1 | tee build.log
 
       - name: Find outputs
         working-directory: sdk
@@ -87,7 +88,8 @@ jobs:
             file ../artifact/fwx.ko
             strings ../artifact/fwx.ko | grep -i vermagic | head -3
           else
-            echo "fwx.ko NOT FOUND"
+            echo "::error::fwx.ko NOT FOUND - build failed"
+            exit 1
           fi
           IPK=$(find bin -name "*fwx*.ipk" -type f 2>/dev/null | head -1)
           if [ -n "$IPK" ]; then
