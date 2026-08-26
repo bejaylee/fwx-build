@@ -38,6 +38,7 @@
 #include "fwx_config.h"
 #include "fwx_mac_filter.h"
 #include "fwx_app_filter.h"
+#include "fwx_ct_data.h"
 
 
 MODULE_LICENSE("GPL");
@@ -66,8 +67,7 @@ u_int32_t fwx_log_level = 3;
 #define feature_list_write_unlock() write_unlock_bh(&af_feature_lock);
 
 
-#define SET_APPID(ct, appid) ((ct)->fwx_data.app_id = (appid))
-#define GET_APPID(ct) ((ct)->fwx_data.app_id)
+/* Per-conntrack app data is now stored in fwx_ct_data (fwx_ct_data.h) */
 #define MAX_OAF_NETLINK_MSG_LEN 1024
 #define MAX_AF_SUPPORT_DATA_LEN 3000
 #define AF_AC_CHARSET_SIZE 256
@@ -2263,6 +2263,7 @@ u_int32_t fwx_hook_gateway_handle(struct sk_buff *skb, struct net_device *dev)
 	u_int8_t smac[ETH_ALEN];
 	enum ip_conntrack_info ctinfo;
 	struct nf_conn *ct = NULL;
+	struct fwx_ct_data *ctd = NULL;
 	struct nf_conn_acct *acct;
 	af_client_info_t *client = NULL;
 	u_int32_t ret = NF_ACCEPT;
@@ -2303,15 +2304,17 @@ u_int32_t fwx_hook_gateway_handle(struct sk_buff *skb, struct net_device *dev)
 	is_record_whitelist = client->record_whitelist;
 	AF_CLIENT_UNLOCK_R();
 
-	if (ct->fwx_data.app_id != 0)
+	ctd = fwx_ct_data_get(ct);
+
+	if (ctd && ctd->app_id != 0)
 	{
-		app_id = ct->fwx_data.app_id;
+		app_id = ctd->app_id;
 		
 		AF_LMT_DEBUG("ct appid = %d\n", app_id);
-		u_int32_t orig_action = ct->fwx_data.action;
+		u_int32_t orig_action = ctd->action;
 
-		int ct_action = ct->fwx_data.action;
-		flow.ignore = (ct->fwx_data.match_status & 0x1) ? 1 : 0;
+		int ct_action = ctd->action;
+		flow.ignore = (ctd->match_status & 0x1) ? 1 : 0;
 
 
 		if (app_id > 0 && app_id < 1000){
@@ -2325,9 +2328,9 @@ u_int32_t fwx_hook_gateway_handle(struct sk_buff *skb, struct net_device *dev)
 		{
 			if (check_app_action_changed(ct_action, app_id, client)){
 				ct_action = !ct_action;
-				ct->fwx_data.action = ct_action;
+				ctd->action = ct_action;
 				AF_LMT_DEBUG("update appid %d action to %s, action = %d-->%d\n",
-					 app_id, ct_action ? "drop" : "accept", orig_action, ct->fwx_data.action);
+					 app_id, ct_action ? "drop" : "accept", orig_action, ctd->action);
 			}
 		
 			if (g_record_enable){
@@ -2343,16 +2346,16 @@ u_int32_t fwx_hook_gateway_handle(struct sk_buff *skb, struct net_device *dev)
 
 	}
 
-	if (ct->fwx_data.action){
+	if (ctd && ctd->action){
 		AF_LMT_DEBUG("ct drop\n");
 		return NF_DROP;
 	}
 
-	if (ct->fwx_data.app_id != 0)
+	if (ctd && ctd->app_id != 0)
 		return NF_ACCEPT;
 
 
-	if (ct->fwx_data.match_status & 0x2) {	
+	if (ctd && (ctd->match_status & 0x2)) {	
 		flow.client_hello = 1;
 	}
 
@@ -2377,28 +2380,36 @@ u_int32_t fwx_hook_gateway_handle(struct sk_buff *skb, struct net_device *dev)
 	if (!is_record_whitelist) {
 		update_url_visiting_info(client, &flow);
 	}
+
+	/* Ensure per-conntrack data exists before writing */
+	if (!ctd) {
+		ctd = fwx_ct_data_get_or_create(ct);
+		if (!ctd)
+			goto out;
+	}
+
 	if (flow.client_hello) {
-		ct->fwx_data.match_status |= 0x2;  
+		ctd->match_status |= 0x2;  
 	}
 	else {
-		ct->fwx_data.match_status &= ~0x2;
+		ctd->match_status &= ~0x2;
 	}
 
 
 	if (fwx_match_feature(&flow)){
-		ct->fwx_data.app_id = flow.app_id;
+		ctd->app_id = flow.app_id;
 		if (flow.app_id < 1000){
 			flow.ignore = 1;
 		}
 		else if (flow.feature && flow.feature->ignore){
-			ct->fwx_data.match_status |= 0x1;  
+			ctd->match_status |= 0x1;  
 			flow.ignore = 1;
-			AF_LMT_DEBUG("gateway set ignore bit, match_status = %u\n", ct->fwx_data.match_status);
+			AF_LMT_DEBUG("gateway set ignore bit, match_status = %u\n", ctd->match_status);
 		}
 		
 		if (match_app_filter_rule(flow.app_id, client)) {
 			flow.drop = 1;
-			ct->fwx_data.action = 1;  
+			ctd->action = 1;  
 			AF_LMT_INFO("##Drop App filter rule, appid = %d, mac = " MAC_FMT "\n", 
 					flow.app_id, MAC_ARRAY(client->mac));
 			if (skb->protocol == htons(ETH_P_IP) && g_tcp_rst){
@@ -2418,7 +2429,7 @@ u_int32_t fwx_hook_gateway_handle(struct sk_buff *skb, struct net_device *dev)
 	if (ret != NF_DROP){
 		if (match_mac_filter_rule(client)) {
 			flow.drop = 1;
-			ct->fwx_data.action = 1;  
+			ctd->action = 1;  
 			AF_LMT_WARN("##Drop MAC filter rule, mac = " MAC_FMT "\n", 
 					MAC_ARRAY(client->mac));
 			if (skb->protocol == htons(ETH_P_IP) && g_tcp_rst){
@@ -2435,6 +2446,7 @@ u_int32_t fwx_hook_gateway_handle(struct sk_buff *skb, struct net_device *dev)
 		}
 	}
 
+out:
 	if (g_record_enable){
 		if (!flow.ignore && !is_record_whitelist){
 			int is_http = (flow.http.match || flow.https.match) ? 1 : 0;
@@ -2576,6 +2588,8 @@ static void fwx_timer_func(unsigned long ptr)
 
 	count++;
 	af_conn_clean_timeout();
+	if (count % 60 == 0)
+		fwx_ct_data_gc();
 
 	mod_timer(&fwx_timer, jiffies + FWX_TIMER_INTERVAL * HZ);
 }
@@ -2718,6 +2732,7 @@ void af_active_host_clean_procfs(void);
 static int __init fwx_init(void)
 {
 	int err;
+	fwx_ct_data_init();
 	af_conn_init();
 	netlink_fwx_init();
 	af_log_init();
@@ -2766,6 +2781,7 @@ static void fwx_fini(void)
 	if (fwx_sock)
 		netlink_kernel_release(fwx_sock);
 	af_conn_exit();
+	fwx_ct_data_fini();
 	return;
 }
 
