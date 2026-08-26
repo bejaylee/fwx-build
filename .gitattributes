@@ -1,0 +1,14 @@
+# Force LF for all source files and Makefiles (critical for cross-compilation)
+* text=auto eol=lf
+*.c text eol=lf
+*.h text eol=lf
+Makefile text eol=lf
+*.mk text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.sh text eol=lf
+*.md text eol=lf
+
+# Windows batch files need CRLF
+*.bat text eol=crlf
+*.cmd text eol=crlf
