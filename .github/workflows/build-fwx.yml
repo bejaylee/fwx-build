@@ -12,7 +12,7 @@ on:
       - 'package/fcm/fwx/**'
 
 env:
-  SDK_URL: https://mirrors.cernet.edu.cn/openwrt/releases/24.10.8/targets/x86/64/openwrt-sdk-24.10.8-x86-64_gcc-13.3.0_musl.Linux-x86_64.tar.zst
+  SDK_URL: https://downloads.openwrt.org/releases/24.10.8/targets/x86/64/openwrt-sdk-24.10.8-x86-64_gcc-13.3.0_musl.Linux-x86_64.tar.zst
   FORCE_UNSAFE_CONFIGURE: "1"
 
 jobs:
